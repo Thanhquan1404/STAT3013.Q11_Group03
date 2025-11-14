@@ -131,8 +131,6 @@ Notably used in studies that evaluate:
 * Predictive modeling for liver transplant prioritization
 * Non-invasive disease staging
 
----
-
 #  **Why These Datasets Matter**
 
 Both datasets are:
@@ -160,8 +158,6 @@ They provide a good balance of:
 * **Phase 2:** Regression models (Logistic, Softmax)
 * **Phase 3:** Non-linear classification (KNN, SVM, Decision Tree, RF)
 * **Phase 4:** Model interpretation (SHAP, PCA, PDA, ROC, F1)
-
----
 
 #  **Suggested Placement in the Repo**
 
