@@ -156,7 +156,7 @@ def run_svm_experiment(X_data, y_data, numerical_features, categorical_features,
 
     elif kernel_to_test == 'rbf':
         param_grid = {
-            'svc__C': [99],
+            'svc__C': [98],
             'svc__gamma': [0.5]
             # Kernel đã được gán 'rbf' trong pipeline
         }
@@ -269,3 +269,4 @@ print("\n" + "="*60)
 print("TẤT CẢ 6 THÍ NGHIỆM RIÊNG BIỆT ĐÃ HOÀN TẤT.")
 
 print("="*60)
+
