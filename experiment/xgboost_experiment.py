@@ -1,320 +1,207 @@
+# ====================================================================
+# UNIVERSAL EXPERIMENT PIPELINE – XGBoost (Custom Implementation)
+# Academic / Research-Grade | Fully Automatic | Binary & Multiclass
+# ====================================================================
 """
-Experiment with K-Folds validation for XGBoost, ROC curve, confusion matrix and export CSV.
+UNIVERSAL XGBoost EXPERIMENT PIPELINE
+=====================================
+• Tự động nhận diện dataset (Indian Liver vs Cirrhosis)
+• Tự động phát hiện nhãn + task (binary/multiclass)
+• Universal preprocessing + scaler factory
+• SMOTE chỉ dùng cho binary
+• Thử nhiều cấu hình eta, depth, subsample...
+• Lưu kết quả vào file CSV tổng hợp (dễ so sánh với SVM, RF, KNN...)
+• Đo thời gian train/test chính xác
 """
 
+import os
+import sys
+import time
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, auc, roc_auc_score
-)
-from sklearn.preprocessing import label_binarize
-from src.xgboost_classifier import XGBoostClassifier
-import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, f1_score, accuracy_score
+from imblearn.over_sampling import SMOTE
+from src.XGBoost import XGBoostClassifier  # ← Custom XGBoost của bạn
+
+# ===========================================================================
+# Scaler Factory (chuẩn hệ thống)
+# ===========================================================================
+def get_scaler(name: str):
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, Normalizer, MaxAbsScaler, QuantileTransformer
+    scalers = {
+        "StandardScaler": StandardScaler(),
+        "MinMaxScaler": MinMaxScaler(),
+        "RobustScaler": RobustScaler(),
+        "Normalizer": Normalizer(),
+        "MaxAbsScaler": MaxAbsScaler(),
+        "QuantileTransformer": QuantileTransformer(output_distribution="normal", random_state=42),
+        None: None
+    }
+    if name not in scalers:
+        raise ValueError(f"Unsupported scaler: {name}")
+    return scalers[name]
+
+# ===========================================================================
+def universal_preprocessing(
+    path: str,
+    scaler_name="StandardScaler",
+    apply_smote=True,
+    random_state=42
+):
+    print(f"\n[INFO] Loading dataset: {os.path.basename(path)}")
+    df = pd.read_csv(path)
+
+    # Auto-detect label column
+    possible_labels = ["Result", "Dataset", "Class", "selector", "target", "Stage", "status", "Diagnosis"]
+    label_col = next((c for c in possible_labels if c in df.columns), None)
+    if label_col is None:
+        raise ValueError("Không tìm thấy cột nhãn!")
+
+    y_raw = df[label_col].copy()
+
+    # Task detection + chuẩn hóa nhãn cho XGBoost
+    unique_vals = sorted(y_raw.dropna().unique().astype(int))
+    if len(unique_vals) > 2 or label_col == "Stage":
+        task = "multiclass"
+        n_classes = len(unique_vals)
+        # Remap nhãn về 0, 1, 2, ..., n-1 (XGBoost bắt buộc!)
+        label_mapping = {old: new for new, old in enumerate(unique_vals)}
+        y = y_raw.map(label_mapping).astype(int).values
+        print(f"[INFO] Multiclass detected → Remapped labels: {unique_vals} → [0, {n_classes-1}]")
+    else:
+        task = "binary"
+        n_classes = 2
+        pos_label = y_raw.max()
+        y = (y_raw == pos_label).astype(int).values  # 0 và 1
+        print(f"[INFO] Binary task → Positive class: {int(pos_label)}")
+
+    # Drop missing label
+    if y_raw.isnull().any():
+        df = df.dropna(subset=[label_col]).reset_index(drop=True)
+
+    X = df.drop(columns=[label_col])
+
+    # Lưu tên cột trước khi scale (để feature importance)
+    feature_names = X.columns.tolist()
+
+    # Encode categorical
+    cat_cols = X.select_dtypes(include=["object", "category"]).columns
+    for col in cat_cols:
+        X[col] = LabelEncoder().fit_transform(X[col].astype(str))
+
+    # Impute numerical
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > 0:
+        X[num_cols] = SimpleImputer(strategy="mean").fit_transform(X[num_cols])
+
+    # Scaling
+    scaler = get_scaler(scaler_name)
+    if scaler is not None:
+        X = scaler.fit_transform(X)
+
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=int)
+
+    # Stratified split
+    stratify = y if task == "binary" or n_classes > 2 else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=random_state, stratify=stratify
+    )
+
+    # SMOTE chỉ cho binary
+    if apply_smote and task == "binary":
+        X_train, y_train = SMOTE(random_state=random_state).fit_resample(X_train, y_train)
+        print(f"[INFO] SMOTE applied → X_train: {X_train.shape}")
+
+    print(f"[INFO] Task: {task.upper()} | Classes: {n_classes} | Train: {X_train.shape[0]} | Test: {X_test.shape[0]}")
+    
+    return X_train, y_train, X_test, y_test, task, label_col, feature_names, unique_vals  
 
 
-class XGBoostExperiment:
-    """
-    XGBoost experiment với K-Folds Cross-Validation.
-    """
-    
-    def __init__(self, eta=0.05, max_depth=6, subsample=0.8, 
-                 colsample_bytree=0.8, num_boost_round=500, 
-                 early_stopping_rounds=50, n_folds=5, verbose=True):
-        """
-        Initialize XGBoost experiment.
-        """
-        self.eta = eta
-        self.max_depth = max_depth
-        self.subsample = subsample
-        self.colsample_bytree = colsample_bytree
-        self.num_boost_round = num_boost_round
-        self.early_stopping_rounds = early_stopping_rounds
-        self.n_folds = n_folds
-        self.verbose = verbose
-        
-        self.fold_results = []
-        self.all_y_true = []
-        self.all_y_pred = []
-        self.all_y_proba = []
-        self.classes_ = None
-        self.feature_importance_list = []
-        self.label_mapping = {}
-        self.reverse_mapping = {}
-    
-    def run(self, X, y):
-        """
-        Run K-Folds experiment.
-        """
-        print("="*80)
-        print(f"   XGBoost K-FOLDS EXPERIMENT | eta={self.eta}, depth={self.max_depth}, folds={self.n_folds}")
-        print("="*80)
-        
-        self.classes_ = np.unique(y)
-        
-        self.label_mapping = {label: idx for idx, label in enumerate(self.classes_)}
-        self.reverse_mapping = {idx: label for label, idx in self.label_mapping.items()}
-        y_mapped = np.array([self.label_mapping[label] for label in y])
-        
-        print(f"\n📋 Label Mapping: {self.label_mapping}")
-        print(f"   Original labels: {self.classes_}")
-        print(f"   Mapped to: {list(self.reverse_mapping.keys())}")
-        
-        skf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=42)
-        
-        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y_mapped), 1):
+# ===========================================================================
+if __name__ == "__main__":
+    # DATASET_PATH = "../data/processed/indian_liver_patient_preprocessed.csv"
+    # OUTPUT_CSV = "../experiment_result/xgboost_indian_liver_patient_result.csv"
+
+    DATASET_PATH = "../data/processed/liver_cirrhosis_preprocessed.csv"
+    OUTPUT_CSV = "../experiment_result/xgboost_liver_cirrhosis_result.csv"
+    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+
+    if not os.path.exists(OUTPUT_CSV):
+        header = "Dataset,Task,Eta,Max_Depth,Subsample,Colsample,Num_Boost,Best_Iter,Test_Accuracy,Test_F1_Weighted,Test_F1_Macro,Train_Time_s,Test_Time_s,Scaler,Timestamp\n"
+        with open(OUTPUT_CSV, "w") as f:
+            f.write(header)
+
+    XGB_CONFIGS = [
+        {"eta": 0.05, "max_depth": 6,  "subsample": 0.8, "colsample_bytree": 0.8, "num_boost_round": 1000},
+        {"eta": 0.1,  "max_depth": 8,  "subsample": 0.9, "colsample_bytree": 0.9, "num_boost_round": 800},
+        {"eta": 0.03, "max_depth": 10, "subsample": 1.0, "colsample_bytree": 1.0, "num_boost_round": 1500},
+    ]
+
+    SCALERS = [None, "StandardScaler", "MinMaxScaler", "RobustScaler", "Normalizer","MaxAbsScaler","QuantileTransformer"]
+
+    for scaler_name in SCALERS:
+        X_train, y_train, X_test, y_test, task, label_col, feature_names, original_labels = universal_preprocessing(
+            path=DATASET_PATH,
+            scaler_name=scaler_name,
+            apply_smote=True,
+            random_state=42
+        )
+
+        for cfg in XGB_CONFIGS:
             print(f"\n{'='*80}")
-            print(f"📊 Fold {fold}/{self.n_folds}")
+            print(f"XGBOOST → η={cfg['eta']} | depth={cfg['max_depth']} | scaler={scaler_name}")
             print(f"{'='*80}")
-            
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y_mapped[train_idx], y_mapped[val_idx]
-            
-            # Train model
-            xgb_model = XGBoostClassifier(
-                eta=self.eta,
-                max_depth=self.max_depth,
-                subsample=self.subsample,
-                colsample_bytree=self.colsample_bytree,
-                num_boost_round=self.num_boost_round,
-                early_stopping_rounds=self.early_stopping_rounds,
-                verbose=self.verbose
+
+            model = XGBoostClassifier(
+                eta=cfg["eta"],
+                max_depth=cfg["max_depth"],
+                subsample=cfg["subsample"],
+                colsample_bytree=cfg["colsample_bytree"],
+                num_boost_round=cfg["num_boost_round"],
+                early_stopping_rounds=50,
+                verbose=False
             )
-            
-            xgb_model.fit(X_train, y_train, X_val, y_val)
-            
-            # Predictions on validation set
-            y_pred = xgb_model.predict(X_val)
-            y_proba = xgb_model.predict_proba(X_val)
-            
-            # Calculate metrics (using mapped labels)
-            metrics = self._calculate_metrics(y_val, y_pred, y_proba)
-            metrics['fold'] = fold
-            metrics['best_iteration'] = xgb_model.model.best_iteration if self.early_stopping_rounds else self.num_boost_round
-            self.fold_results.append(metrics)
-            
-            # Store feature importance
-            if xgb_model.model is not None:
-                importance = xgb_model.model.get_score(importance_type='weight')
-                self.feature_importance_list.append(importance)
-            
-            # Store for overall metrics (convert back to original labels)
-            y_val_original = np.array([self.reverse_mapping[label] for label in y_val])
-            y_pred_original = np.array([self.reverse_mapping[label] for label in y_pred])
-            
-            self.all_y_true.extend(y_val_original)
-            self.all_y_pred.extend(y_pred_original)
-            self.all_y_proba.extend(y_proba)
-            
-            # Print fold results
-            print(f"\n{'─'*80}")
-            print(f"📈 Fold {fold} Results:")
-            print(f"{'─'*80}")
-            print(f"   Accuracy:  {metrics['accuracy']:.4f}")
-            print(f"   Precision: {metrics['precision']:.4f}")
-            print(f"   Recall:    {metrics['recall']:.4f}")
-            print(f"   F1-Score:  {metrics['f1_score']:.4f}")
-            if not np.isnan(metrics['roc_auc']):
-                print(f"   ROC-AUC:   {metrics['roc_auc']:.4f}")
-            print(f"   Best Iteration: {metrics['best_iteration']}")
-        
-        self._print_summary()
-        
-        return self
-    
-    def _calculate_metrics(self, y_true, y_pred, y_proba):
-        """Calculate all metrics for one fold."""
-        metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, average='weighted', zero_division=0),
-            'recall': recall_score(y_true, y_pred, average='weighted', zero_division=0),
-            'f1_score': f1_score(y_true, y_pred, average='weighted', zero_division=0)
-        }
-        
-        # ROC-AUC
-        try:
-            if len(np.unique(y_true)) == 2:
-                metrics['roc_auc'] = roc_auc_score(y_true, y_proba[:, 1])
+
+            start_train = time.time()
+            model.fit(X_train, y_train, X_test, y_test)
+            train_time = time.time() - start_train
+
+            start_test = time.time()
+            y_pred = model.predict(X_test)
+            y_proba = model.predict_proba(X_test)
+            test_time = time.time() - start_test
+
+            # Chuyển lại nhãn gốc để tính metrics đúng
+            if task == "multiclass":
+                inv_map = {i: label for i, label in enumerate(original_labels)}
+                y_test_orig = np.array([inv_map[label] for label in y_test])
+                y_pred_orig = np.array([inv_map[label] for label in y_pred])
             else:
-                metrics['roc_auc'] = roc_auc_score(
-                    y_true, y_proba, 
-                    multi_class='ovr', 
-                    average='weighted'
-                )
-        except:
-            metrics['roc_auc'] = np.nan
-        
-        return metrics
-    
-    def _print_summary(self):
-        """Print overall summary."""
-        df = pd.DataFrame(self.fold_results)
-        
-        print("\n" + "="*80)
-        print("                         SUMMARY RESULTS")
-        print("="*80)
-        
-        print(f"\n{'Metric':<15} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
-        print("-"*80)
-        
-        for col in ['accuracy', 'precision', 'recall', 'f1_score', 'roc_auc']:
-            if col in df.columns:
-                mean_val = df[col].mean()
-                std_val = df[col].std()
-                min_val = df[col].min()
-                max_val = df[col].max()
-                
-                print(f"{col.capitalize():<15} "
-                      f"{mean_val:<12.4f} "
-                      f"{std_val:<12.4f} "
-                      f"{min_val:<12.4f} "
-                      f"{max_val:<12.4f}")
-        
-        # Best iteration summary
-        if 'best_iteration' in df.columns:
-            print(f"{'Best Iteration':<15} "
-                  f"{df['best_iteration'].mean():<12.1f} "
-                  f"{df['best_iteration'].std():<12.1f} "
-                  f"{df['best_iteration'].min():<12.0f} "
-                  f"{df['best_iteration'].max():<12.0f}")
-        
-        print("="*80)
-    
-    def save_metrics_csv(self, filename='xgboost_metrics.csv'):
-        """Save all metrics to CSV."""
-        df = pd.DataFrame(self.fold_results)
-        
-        # Add summary row (mean)
-        summary = {
-            'fold': 'MEAN',
-            'accuracy': df['accuracy'].mean(),
-            'precision': df['precision'].mean(),
-            'recall': df['recall'].mean(),
-            'f1_score': df['f1_score'].mean(),
-            'roc_auc': df['roc_auc'].mean(),
-            'best_iteration': df['best_iteration'].mean()
-        }
-        df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
-        
-        # Add std row
-        summary_std = {
-            'fold': 'STD',
-            'accuracy': df['accuracy'][:-1].std(),
-            'precision': df['precision'][:-1].std(),
-            'recall': df['recall'][:-1].std(),
-            'f1_score': df['f1_score'][:-1].std(),
-            'roc_auc': df['roc_auc'][:-1].std(),
-            'best_iteration': df['best_iteration'][:-1].std()
-        }
-        df = pd.concat([df, pd.DataFrame([summary_std])], ignore_index=True)
-        
-        df.to_csv(filename, index=False)
-        print(f"\n✔️ Metrics saved to: {filename}")
-    
-    def plot_confusion_matrix(self, filename='xgboost_confusion_matrix.png'):
-        """Plot confusion matrix."""
-        cm = confusion_matrix(self.all_y_true, self.all_y_pred)
-        
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', 
-                    xticklabels=self.classes_, yticklabels=self.classes_)
-        plt.title(f'Confusion Matrix - XGBoost (eta={self.eta}, depth={self.max_depth})', 
-                  fontsize=14, fontweight='bold')
-        plt.xlabel('Predicted', fontsize=12)
-        plt.ylabel('Actual', fontsize=12)
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print(f"✔️ Confusion matrix saved to: {filename}")
-    
-    def plot_roc_curve(self, filename='xgboost_roc_curve.png'):
-        """Plot ROC curve."""
-        y_true = np.array(self.all_y_true)
-        y_proba = np.array(self.all_y_proba)
-        
-        plt.figure(figsize=(10, 8))
-        
-        if len(self.classes_) == 2:
-            y_true_mapped = np.array([self.label_mapping[label] for label in y_true])
-            pos_label = 1  
-            
-            fpr, tpr, _ = roc_curve(y_true_mapped, y_proba[:, 1], pos_label=pos_label)
-            roc_auc = auc(fpr, tpr)
-            
-            plt.plot(fpr, tpr, linewidth=2, label=f'ROC (AUC = {roc_auc:.4f})', color='green')
-            plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
-            
-        else:
-            # Multi-class classification
-            y_true_mapped = np.array([self.label_mapping[label] for label in y_true])
-            y_true_bin = label_binarize(y_true_mapped, classes=list(range(len(self.classes_))))
-            colors = plt.cm.Set2(np.linspace(0, 1, len(self.classes_)))
-            
-            for i, (cls, color) in enumerate(zip(self.classes_, colors)):
-                fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_proba[:, i])
-                roc_auc = auc(fpr, tpr)
-                plt.plot(fpr, tpr, linewidth=2, color=color,
-                        label=f'Class {cls} (AUC = {roc_auc:.4f})')
-            
-            plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
-        
-        plt.xlabel('False Positive Rate', fontsize=12)
-        plt.ylabel('True Positive Rate', fontsize=12)
-        plt.title(f'ROC Curve - XGBoost (eta={self.eta}, depth={self.max_depth})', fontsize=14, fontweight='bold')
-        plt.legend(loc='lower right', fontsize=10)
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print(f"✔️ ROC curve saved to: {filename}")
-    
-    def plot_feature_importance(self, feature_names=None, top_n=20, filename='xgboost_feature_importance.png'):
-        """
-        Plot average feature importance across all folds.
-        """
-        if not self.feature_importance_list:
-            print("⚠️ No feature importance data available")
-            return
-        
-        # Aggregate importance across folds
-        all_features = set()
-        for imp_dict in self.feature_importance_list:
-            all_features.update(imp_dict.keys())
-        
-        # Calculate mean importance
-        importance_mean = {}
-        for feat in all_features:
-            scores = [imp_dict.get(feat, 0) for imp_dict in self.feature_importance_list]
-            importance_mean[feat] = np.mean(scores)
-        
-        # Sort and get top N
-        sorted_importance = sorted(importance_mean.items(), key=lambda x: x[1], reverse=True)
-        top_features = sorted_importance[:top_n]
-        
-        # Prepare data for plotting
-        features = [f[0] for f in top_features]
-        scores = [f[1] for f in top_features]
-        
-        # Map feature indices to names if provided
-        if feature_names is not None:
-            features = [feature_names[int(f[1:])] if f.startswith('f') else f for f in features]
-        
-        # Plot
-        plt.figure(figsize=(10, max(6, len(features) * 0.3)))
-        colors = plt.cm.Greens(np.linspace(0.4, 0.8, len(features)))
-        plt.barh(range(len(features)), scores, color=colors)
-        plt.yticks(range(len(features)), features)
-        plt.xlabel('Average Importance Score', fontsize=12)
-        plt.title(f'Top {top_n} Feature Importance - XGBoost', fontsize=14, fontweight='bold')
-        plt.gca().invert_yaxis()
-        plt.grid(axis='x', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print(f"✔️ Feature importance plot saved to: {filename}")
+                y_test_orig = y_test
+                y_pred_orig = y_pred
+
+            report = classification_report(y_test_orig, y_pred_orig, output_dict=True, zero_division=0)
+            acc = report["accuracy"]
+            f1w = report["weighted avg"]["f1-score"]
+            f1m = report.get("macro avg", {}).get("f1-score", f1_score(y_test_orig, y_pred_orig, average="macro"))
+
+            best_iter = model.model.best_iteration if hasattr(model.model, 'best_iteration') else cfg["num_boost_round"]
+
+            row = [
+                os.path.basename(DATASET_PATH), task, cfg["eta"], cfg["max_depth"],
+                cfg["subsample"], cfg["colsample_bytree"], cfg["num_boost_round"], best_iter,
+                round(acc, 4), round(f1w, 4), round(f1m, 4),
+                round(train_time, 4), round(test_time, 4), scaler_name,
+                time.strftime("%Y%m%d_%H%M%S")
+            ]
+            pd.DataFrame([row]).to_csv(OUTPUT_CSV, mode="a", header=False, index=False)
+
+            print(f"SAVED | Acc: {acc:.4f} | F1w: {f1w:.4f} | Best Iter: {best_iter}\n")
+
+    print(f"\nHOÀN TẤT! Kết quả XGBoost đã lưu tại: {OUTPUT_CSV}")
