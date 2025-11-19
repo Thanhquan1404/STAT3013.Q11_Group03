@@ -13,61 +13,57 @@ from sklearn.metrics import classification_report
 from imblearn.over_sampling import SMOTE
 
 # ===========================================================================
-# 1. SETUP ĐƯỜNG DẪN (Tự động tìm về thư mục gốc dự án)
+# 1. SETUP ĐƯỜNG DẪN
 # ===========================================================================
 current_file = os.path.abspath(__file__)
-src_dir = os.path.dirname(current_file)       # Folder experiment
-project_root = os.path.dirname(src_dir)       # Folder Root (liver-disease-ml-research)
+src_dir = os.path.dirname(current_file)
+project_root = os.path.dirname(src_dir)
 sys.path.append(project_root) 
 
-# IMPORT MODEL (File nằm trong src/models/svm_model.py)
 try:
-    from src.models.svm_model import SVMClassifier
+    from src.models.svm import SVMClassifier
 except ImportError:
-    # Fallback phòng hờ
-    try:
-        spec = importlib.util.spec_from_file_location("SVMClassifier", os.path.join(project_root, "src", "models", "svm_model.py"))
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            SVMClassifier = module.SVMClassifier
-    except: pass
-
-if 'SVMClassifier' not in locals() or SVMClassifier is None:
-    print("❌ Lỗi Critical: Không tìm thấy src/models/svm_model.py"); sys.exit(1)
+    print("❌ Lỗi: Không tìm thấy src/svm.py"); sys.exit(1)
 
 # ===========================================================================
-# 2. CẤU HÌNH DỮ LIỆU (ĐÃ SỬA TÊN FILE CHO KHỚP GIT )
+# 2. CẤU HÌNH THÍ NGHIỆM (ĐÃ NÂNG CẤP)
 # ===========================================================================
 DATASET_CONFIGS = [
     {
         "name": "Cirrhosis",
-        # ⚠️ Đã sửa từ 'liver_cirrhosis.csv' thành 'cirrhosis.csv' để khớp file Git
-        "input_path": os.path.join(project_root, "data", "raw", "cirrhosis.csv"),
-        "output_path": os.path.join(project_root, "results", "metrics", "svm_cirrhosis_summary.csv")
+        "input_path": os.path.join(project_root, "data", "raw", "liver_cirrhosis.csv"),
+        "output_path": os.path.join(project_root, "results", "result_cirrhosis.csv")
     },
     {
         "name": "Indian Liver",
         "input_path": os.path.join(project_root, "data", "raw", "indian_liver_patient.csv"),
-        "output_path": os.path.join(project_root, "results", "metrics", "svm_indian_liver_summary.csv")
+        "output_path": os.path.join(project_root, "results", "result_indian.csv")
     }
 ]
 
-# ===========================================================================
-# 3. HÀM CONFIGS & PREPROCESSING
-# ===========================================================================
+# Hàm tạo danh sách cấu hình linh động
 def get_configs():
     configs = []
-    # Linear
-    for c in [1, 10]: configs.append({'kernel': 'linear', 'C': c})
-    # RBF
+    
+    # 1. Linear Kernel (Chỉ cần C)
+    for c in [1, 10]:
+        configs.append({'kernel': 'linear', 'C': c})
+        
+    # 2. RBF Kernel (Cần C và Gamma)
     for c in [10]:
-        for g in [1, 0.5]: configs.append({'kernel': 'rbf', 'C': c, 'gamma': g})
-    # Poly
+        for g in [1, 0.5]:
+            configs.append({'kernel': 'rbf', 'C': c, 'gamma': g})
+            
+    # 3. Polynomial Kernel (Cần C và Degree)
     for c in [10]:
-        for d in [2, 3]: configs.append({'kernel': 'poly', 'C': c, 'degree': d, 'gamma': 'scale'})
+        for d in [2, 3]: # Bậc 2 và bậc 3
+            configs.append({'kernel': 'poly', 'C': c, 'degree': d, 'gamma': 'scale'})
+            
     return configs
 
+# ===========================================================================
+# 3. XỬ LÝ DỮ LIỆU
+# ===========================================================================
 def get_scaler(name):
     return {"StandardScaler": StandardScaler(), "MinMaxScaler": MinMaxScaler(), "RobustScaler": RobustScaler()}.get(name)
 
@@ -109,28 +105,25 @@ def process_data(df, scaler_name):
     return X_train, y_train, X_test, y_test, task, smote_stt
 
 # ===========================================================================
-# 4. MAIN LOOP (HIỂN THỊ ĐẦY ĐỦ CV, TEST, F1)
+# 4. MAIN LOOP
 # ===========================================================================
 if __name__ == "__main__":
-    SVM_CONFIGS = get_configs()
+    SVM_CONFIGS = get_configs() # Lấy danh sách config đa dạng
     SCALERS = ["StandardScaler", "MinMaxScaler"]
 
     for config in DATASET_CONFIGS:
         print(f"\n{'='*80}")
         print(f"📂 DATASET: {config['name']}")
         
-        # Tạo folder results/metrics nếu chưa có 
+        # Tạo header CSV (Thêm cột Degree để chứa thông tin cho Poly)
         os.makedirs(os.path.dirname(config['output_path']), exist_ok=True)
-        
         if not os.path.exists(config['output_path']):
             with open(config['output_path'], "w", encoding="utf-8") as f:
                 f.write("Dataset,Task,Kernel,C,Gamma,Degree,CV_Acc,Test_Acc,Test_F1,Time_Train,Time_Test,Scaler\n")
 
         try:
             df_master = pd.read_csv(config['input_path'])
-            print(f"✅ Đã load file: {os.path.basename(config['input_path'])}")
-        except: 
-            print(f"❌ Lỗi: Không tìm thấy file {config['input_path']}"); continue
+        except: print("❌ Lỗi data!"); continue
 
         total_runs = len(SCALERS) * len(SVM_CONFIGS)
         current_run = 0
@@ -142,34 +135,35 @@ if __name__ == "__main__":
 
             for cfg in SVM_CONFIGS:
                 current_run += 1
+                
+                # Tạo chuỗi log hiển thị tham số linh động
+                # Nếu không có gamma/degree trong cfg thì hiển thị khoảng trắng
                 param_str = f"C={cfg['C']}"
                 if 'gamma' in cfg: param_str += f", g={cfg['gamma']}"
                 if 'degree' in cfg: param_str += f", d={cfg['degree']}"
                 
-                # Hiển thị tiến độ
                 print(f"   👉 [{current_run}/{total_runs}] {scaler_name:<15} | {cfg['kernel']:<6} | {param_str} ... ", end="", flush=True)
                 
+                # TRUYỀN THAM SỐ LINH ĐỘNG VÀO MODEL (**cfg)
+                # Dòng này quan trọng: Nó tự bung dict cfg thành các tham số kernel='...', C=...
                 model = SVMClassifier(verbose=False, **cfg)
                 
-                # 1. TÍNH CV ACCURACY
                 try:
                     cv_acc = np.mean(cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy', n_jobs=-1))
                 except: cv_acc = 0.0
                 
-                # 2. TRAIN & TEST
                 t0 = time.time(); model.fit(X_train, y_train); t_train = time.time() - t0
                 t0 = time.time(); y_pred = model.predict(X_test); t_test = time.time() - t0
                 
-                # 3. TÍNH TEST ACC & F1 SCORE
                 report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
                 test_acc = report['accuracy']
-                f1 = report['weighted avg']['f1-score'] # F1 Weighted
+                f1 = report['weighted avg']['f1-score']
 
-                # In ra màn hình (Đúng yêu cầu của bạn)
-                print(f"✅ CV: {cv_acc:.1%} | Test: {test_acc:.1%} | F1: {f1:.1%}")
+                print(f"✅ CV: {cv_acc:.1%} | Test: {test_acc:.1%}")
                 
-                gamma_val = cfg.get('gamma', '')
-                degree_val = cfg.get('degree', '')
+                # Lấy giá trị an toàn để ghi CSV (nếu không có thì ghi None)
+                gamma_val = cfg.get('gamma', 'nan')
+                degree_val = cfg.get('degree', 'nan')
 
                 row = [config['name'], task, cfg['kernel'], cfg['C'], gamma_val, degree_val,
                        round(cv_acc,4), round(test_acc,4), round(f1,4), 
@@ -178,4 +172,4 @@ if __name__ == "__main__":
                 with open(config['output_path'], "a") as f:
                     f.write(",".join(map(str, row)) + "\n")
 
-    print(f"\n🏁 HOÀN TẤT! Kết quả đã lưu vào results/metrics/")
+    print(f"\n🏁 HOÀN TẤT! Đã chạy đủ Linear, Poly và RBF.")
